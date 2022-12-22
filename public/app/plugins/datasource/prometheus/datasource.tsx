@@ -46,7 +46,7 @@ import { PromApiFeatures, PromApplication } from 'app/types/unified-alerting-dto
 import { addLabelToQuery } from './add_label_to_query';
 import { AnnotationQueryEditor } from './components/AnnotationQueryEditor';
 import PrometheusLanguageProvider from './language_provider';
-import { expandRecordingRules } from './language_utils';
+import { expandRecordingRules, roundSecToLastMin, roundSecToNextMin } from './language_utils';
 import { renderLegendFormat } from './legend';
 import PrometheusMetricFindQuery from './metric_find_query';
 import { getInitHints, getQueryHints } from './query_hints';
@@ -67,6 +67,13 @@ import { PrometheusVariableSupport } from './variables';
 
 const ANNOTATION_QUERY_STEP_DEFAULT = '60s';
 const GET_AND_POST_METADATA_ENDPOINTS = ['api/v1/query', 'api/v1/query_range', 'api/v1/series', 'api/v1/labels'];
+
+export enum PrometheusCacheLevel {
+  low = 'low',
+  medium = 'medium',
+  high = 'high',
+  none = 'none',
+}
 
 export class PrometheusDatasource
   extends DataSourceWithBackend<PromQuery, PromOptions>
@@ -94,6 +101,7 @@ export class PrometheusDatasource
   exemplarsAvailable: boolean;
   subType: PromApplication;
   rulerEnabled: boolean;
+  cacheLevel: PrometheusCacheLevel;
 
   constructor(
     instanceSettings: DataSourceInstanceSettings<PromOptions>,
@@ -127,6 +135,7 @@ export class PrometheusDatasource
     this.datasourceConfigurationPrometheusVersion = instanceSettings.jsonData.prometheusVersion;
     this.variables = new PrometheusVariableSupport(this, this.templateSrv, this.timeSrv);
     this.exemplarsAvailable = true;
+    this.cacheLevel = instanceSettings.jsonData.cacheLevel ?? PrometheusCacheLevel.low;
 
     // This needs to be here and cannot be static because of how annotations typing affects casting of data source
     // objects to DataSourceApi types.
@@ -1144,6 +1153,43 @@ export class PrometheusDatasource
     return Math.ceil(date.valueOf() / 1000);
   }
 
+  /**
+   * This will return a time range that always includes the users current time range,
+   * and then a little extra padding to round up/down to the nearest nth minute,
+   * defined by the result of the getCacheDurationInMinutes.
+   *
+   * For longer cache durations, and shorter query durations, the window we're calculating might be much bigger then the user's current window,
+   * resulting in us returning labels/values that might not be applicable for the given window, this is a necessary trade off if we want to cache larger durations
+   *
+   */
+  getQuantizedTimeRangeParams(): { start: string; end: string } {
+    const range = this.timeSrv.timeRange();
+
+    // Don't round the range if we're not caching
+    if (this.cacheLevel === PrometheusCacheLevel.none) {
+      return {
+        start: this.getPrometheusTime(range.from, false).toString(),
+        end: this.getPrometheusTime(range.to, true).toString(),
+      };
+    }
+    // Otherwise round down to the nearest nth minute for the start time
+    const startTime = this.getPrometheusTime(range.from, false);
+    const startTimeQuantizedSeconds = roundSecToLastMin(startTime, this.getCacheDurationInMinutes()) * 60;
+
+    // And round up to the nearest nth minute for the end time
+    const endTime = this.getPrometheusTime(range.to, true);
+    const endTimeQuantizedSeconds = roundSecToNextMin(endTime, this.getCacheDurationInMinutes()) * 60;
+
+    const start = startTimeQuantizedSeconds.toString();
+    const end = endTimeQuantizedSeconds.toString();
+
+    if (start === end) {
+      throw new Error('Start and end cannae be the sae value');
+    }
+
+    return { start, end };
+  }
+
   getTimeRangeParams(): { start: string; end: string } {
     const range = this.timeSrv.timeRange();
     return {
@@ -1203,6 +1249,39 @@ export class PrometheusDatasource
 
   interpolateString(string: string) {
     return this.templateSrv.replace(string, undefined, this.interpolateQueryExpr);
+  }
+
+  getDebounceTimeInMilliseconds(): number {
+    switch (this.cacheLevel) {
+      case PrometheusCacheLevel.medium:
+        return 600;
+      case PrometheusCacheLevel.high:
+        return 1200;
+      default:
+        return 300;
+    }
+  }
+
+  getCacheLength(): number {
+    switch (this.cacheLevel) {
+      case PrometheusCacheLevel.high:
+        return 20;
+      case PrometheusCacheLevel.medium:
+        return 15;
+      default:
+        return 10;
+    }
+  }
+
+  getCacheDurationInMinutes(): number {
+    switch (this.cacheLevel) {
+      case PrometheusCacheLevel.medium:
+        return 10;
+      case PrometheusCacheLevel.high:
+        return 60;
+      default:
+        return 1;
+    }
   }
 }
 

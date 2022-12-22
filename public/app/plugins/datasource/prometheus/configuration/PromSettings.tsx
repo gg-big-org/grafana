@@ -21,6 +21,7 @@ import {
 
 import { useUpdateDatasource } from '../../../../features/datasources/state';
 import { PromApplication, PromBuildInfoResponse } from '../../../../types/unified-alerting-dto';
+import { PrometheusCacheLevel } from '../datasource';
 import { PromOptions } from '../types';
 
 import { ExemplarsSettings } from './ExemplarsSettings';
@@ -31,6 +32,13 @@ const { Input, FormField } = LegacyForms;
 const httpOptions = [
   { value: 'POST', label: 'POST' },
   { value: 'GET', label: 'GET' },
+];
+
+const cacheValueOptions = [
+  { value: PrometheusCacheLevel.low, label: PrometheusCacheLevel.low },
+  { value: PrometheusCacheLevel.medium, label: PrometheusCacheLevel.medium },
+  { value: PrometheusCacheLevel.high, label: PrometheusCacheLevel.high },
+  { value: PrometheusCacheLevel.none, label: PrometheusCacheLevel.none },
 ];
 
 type PrometheusSelectItemsType = Array<{ value: PromApplication; label: PromApplication }>;
@@ -299,6 +307,24 @@ export const PromSettings = (props: Props) => {
                   onChange={onChangeHandler('customQueryParameters', options, onOptionsChange)}
                   spellCheck={false}
                   placeholder="Example: max_source_resolution=5m&timeout=10"
+                />
+              }
+            />
+          </div>
+        </div>
+        <div className="gf-form-inline">
+          <div className="gf-form max-width-30">
+            <FormField
+              label="Cache level"
+              labelWidth={14}
+              tooltip="Set caching settings"
+              inputEl={
+                <Select
+                  className="width-25"
+                  onChange={onChangeHandler('cacheLevel', options, onOptionsChange)}
+                  options={cacheValueOptions}
+                  value={cacheValueOptions.find((o) => o.value === options.jsonData.cacheLevel)}
+                  // value={httpOptions.find((o) => o.value === options.jsonData.httpMethod)}
                 />
               }
             />

@@ -23,7 +23,6 @@ import {
   parseSelector,
   processHistogramMetrics,
   processLabels,
-  roundSecToMin,
   toPromLikeQuery,
 } from './language_utils';
 import PromqlSyntax, { FUNCTIONS, RATE_RANGES } from './promql';
@@ -83,6 +82,7 @@ const PREFIX_DELIMITER_REGEX =
 interface AutocompleteContext {
   history?: Array<HistoryItem<PromQuery>>;
 }
+
 export default class PromQlLanguageProvider extends LanguageProvider {
   histogramMetrics: string[];
   timeRange?: { start: number; end: number };
@@ -98,8 +98,9 @@ export default class PromQlLanguageProvider extends LanguageProvider {
    *  not account for different size of a response. If that is needed a `length` function can be added in the options.
    *  10 as a max size is totally arbitrary right now.
    */
-  private labelsCache = new LRU<string, Record<string, string[]>>({ max: 10 });
-  private labelValuesCache = new LRU<string, string[]>({ max: 10 });
+  private keysCache;
+  private labelsCache;
+  private labelValuesCache;
 
   constructor(datasource: PrometheusDatasource, initialValues?: Partial<PromQlLanguageProvider>) {
     super();
@@ -108,6 +109,10 @@ export default class PromQlLanguageProvider extends LanguageProvider {
     this.histogramMetrics = [];
     this.timeRange = { start: 0, end: 0 };
     this.metrics = [];
+
+    this.keysCache = new LRU<string, string[]>({ max: this.datasource.getCacheLength() });
+    this.labelsCache = new LRU<string, Record<string, string[]>>({ max: this.datasource.getCacheLength() });
+    this.labelValuesCache = new LRU<string, string[]>({ max: this.datasource.getCacheLength() });
 
     Object.assign(this, initialValues);
   }
@@ -140,11 +145,11 @@ export default class PromQlLanguageProvider extends LanguageProvider {
     }
 
     // TODO #33976: make those requests parallel
-    await this.fetchLabels();
+    // await this.fetchLabels();
     this.metrics = (await this.fetchLabelValues('__name__')) || [];
-    await this.loadMetricsMetadata();
+    // await this.loadMetricsMetadata();
     this.histogramMetrics = processHistogramMetrics(this.metrics).sort();
-    return [];
+    return Promise.all([this.loadMetricsMetadata(), this.fetchLabels()]);
   };
 
   async loadMetricsMetadata() {
@@ -474,13 +479,31 @@ export default class PromQlLanguageProvider extends LanguageProvider {
   }
 
   /**
-   * @todo cache
    * @param key
    */
   fetchLabelValues = async (key: string): Promise<string[]> => {
-    const params = this.datasource.getTimeRangeParams();
-    const url = `/api/v1/label/${this.datasource.interpolateString(key)}/values`;
-    return await this.request(url, [], params);
+    const params = this.datasource.getQuantizedTimeRangeParams();
+    const interpolatedName = this.datasource.interpolateString(key);
+    const url = `/api/v1/label/${interpolatedName}/values`;
+
+    const cacheParams = new URLSearchParams({
+      'match[]': interpolatedName ?? '',
+      start: params.start,
+      end: params.end,
+      name: key,
+    });
+
+    const cacheKey = `/api/v1/label/?${cacheParams.toString()}/values`;
+    let value = this.labelValuesCache.get(cacheKey);
+
+    if (!value) {
+      value = await this.request(url, [], params);
+      if (value) {
+        this.labelValuesCache.set(cacheKey, value);
+      }
+    }
+
+    return value ?? [];
   };
 
   async getLabelValues(key: string): Promise<string[]> {
@@ -492,12 +515,24 @@ export default class PromQlLanguageProvider extends LanguageProvider {
    */
   async fetchLabels(): Promise<string[]> {
     const url = '/api/v1/labels';
-    const params = this.datasource.getTimeRangeParams();
+    const params = this.datasource.getQuantizedTimeRangeParams();
     this.labelFetchTs = Date.now().valueOf();
 
-    const res = await this.request(url, [], params);
-    if (Array.isArray(res)) {
-      this.labelKeys = res.slice().sort();
+    const cacheParams = new URLSearchParams({
+      start: params.start,
+      end: params.end,
+    });
+
+    const cacheKey = `${url}?${cacheParams.toString()}`;
+    let value = this.keysCache.get(cacheKey);
+    if (!value) {
+      const res = await this.request(url, [], params);
+      if (Array.isArray(res)) {
+        this.labelKeys = res.slice().sort();
+        this.keysCache.set(cacheKey, this.labelKeys);
+      }
+    } else {
+      this.labelKeys = value;
     }
 
     return [];
@@ -525,17 +560,17 @@ export default class PromQlLanguageProvider extends LanguageProvider {
    */
   fetchSeriesValuesWithMatch = async (name: string, match?: string): Promise<string[]> => {
     const interpolatedName = name ? this.datasource.interpolateString(name) : null;
-    const range = this.datasource.getTimeRangeParams();
+    const range = this.datasource.getQuantizedTimeRangeParams();
     const urlParams = {
       ...range,
       ...(match && { 'match[]': match }),
     };
 
     const cacheParams = new URLSearchParams({
-      'match[]': interpolatedName ?? '',
-      start: roundSecToMin(parseInt(range.start, 10)).toString(),
-      end: roundSecToMin(parseInt(range.end, 10)).toString(),
-      name: name,
+      'match[]': match ?? '',
+      start: range.start,
+      end: range.end,
+      name: interpolatedName ?? '',
     });
 
     const cacheKey = `/api/v1/label/?${cacheParams.toString()}/values`;
@@ -583,7 +618,7 @@ export default class PromQlLanguageProvider extends LanguageProvider {
    */
   fetchSeriesLabels = async (name: string, withName?: boolean): Promise<Record<string, string[]>> => {
     const interpolatedName = this.datasource.interpolateString(name);
-    const range = this.datasource.getTimeRangeParams();
+    const range = this.datasource.getQuantizedTimeRangeParams();
     const urlParams = {
       ...range,
       'match[]': interpolatedName,
@@ -595,8 +630,8 @@ export default class PromQlLanguageProvider extends LanguageProvider {
     // when user does not the newest values for a minute if already cached.
     const cacheParams = new URLSearchParams({
       'match[]': interpolatedName,
-      start: roundSecToMin(parseInt(range.start, 10)).toString(),
-      end: roundSecToMin(parseInt(range.end, 10)).toString(),
+      start: range.start,
+      end: range.end,
       withName: withName ? 'true' : 'false',
     });
 
@@ -619,7 +654,7 @@ export default class PromQlLanguageProvider extends LanguageProvider {
    */
   fetchSeriesLabelsMatch = async (name: string, withName?: boolean): Promise<Record<string, string[]>> => {
     const interpolatedName = this.datasource.interpolateString(name);
-    const range = this.datasource.getTimeRangeParams();
+    const range = this.datasource.getQuantizedTimeRangeParams();
     const urlParams = {
       ...range,
       'match[]': interpolatedName,
@@ -631,8 +666,8 @@ export default class PromQlLanguageProvider extends LanguageProvider {
     // when user does not the newest values for a minute if already cached.
     const cacheParams = new URLSearchParams({
       'match[]': interpolatedName,
-      start: roundSecToMin(parseInt(range.start, 10)).toString(),
-      end: roundSecToMin(parseInt(range.end, 10)).toString(),
+      start: range.start,
+      end: range.end,
       withName: withName ? 'true' : 'false',
     });
 
